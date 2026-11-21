@@ -80,23 +80,29 @@ Lovable, Cursor and Codex read:
 Your browser key is on the EZLogs install page. It is public by design (it sits in your app's
 JavaScript): it can only send failure reports, never read anything.
 
-## Page views (optional, 0.3.0)
+## Page views (optional, 0.3.0; records 0.3.1)
 
 Off unless you turn on **Page views** for the app in EZLogs (Settings → API keys → Install →
 Lovable · Bolt · v0) and pass your app's routes:
 
 ```ts
 init({ key: "ezlpub_…", supabaseUrl: import.meta.env.VITE_SUPABASE_URL,
-       pages: ["/", "/tasks", "/tasks/:id", "/settings", "/u/:id"] });
+       pages: ["/", "/tasks", "/tasks/:taskId", "/settings", "/u/:username"] });
 ```
 
-Then, for a signed-in person, it sends which page they opened, as the matching route (`/tasks/:id`),
+Then, for a signed-in person, it sends which page they opened, as the matching route (`/tasks/:taskId`),
 and the tables that page read in its first 5 seconds (names only). They read in EZLogs as
-"Ana viewed task".
+"Ana viewed task 'Launch plan'".
 
 - A page is named **only** by your route list: fixed parts as written, each changing part as
-  `:name` (`$name` and `[name]` work too), a catch-all as `*`. An address that matches no route is
-  sent as "a page", never as itself. The most specific route wins (`/tasks/new` over `/tasks/:id`).
+  `:name` with your router's own parameter name (`$name` and `[name]` work too), a catch-all as
+  `*`. An address that matches no route is sent as "a page", never as itself. The most specific
+  route wins (`/tasks/new` over `/tasks/:id`).
+- The record a page shows: where your route calls a part an id (`:id`, `$taskId`, `[post_id]`,
+  `:uuid`) and its value is a database id (a UUID, a ULID or a number), that id is sent
+  (`/tasks/b38a12a9-…`), and EZLogs names the record as your database named it then: "Ana viewed
+  task 'Launch plan'". EZLogs keeps the id only when it is a record your database sent it, or of a
+  table the page read; any other part (`/u/$username`, `/blog/[slug]`) is never sent.
 - Never a query string, a fragment, the page title or anything on the page; never what a read
   returned. Nothing for a person who isn't signed in. Nothing is stored on the device.
 - A route change is `pushState`, `replaceState`, the back button or a hash change (hash routers,

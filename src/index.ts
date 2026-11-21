@@ -27,8 +27,9 @@
  * app call is never sent with a header it would refuse.
  *
  * Page views (only with `pages`, when the app's owner turned them on in EZLogs): which page a
- * signed-in person opened, named only by the route list you pass (`["/tasks", "/tasks/:id"]`):
- * a page not in it is sent as "a page", never its address. With it, the tables that page read in
+ * signed-in person opened, named only by the route list you pass (`["/tasks", "/tasks/:taskId"]`):
+ * a page not in it is sent as "a page", never its address. A record's id is sent only where the
+ * route calls the part an id and its value is a database id (UUID, ULID, number). With it, the tables that page read in
  * its first 5 seconds (names only, never what was read). Never a query string, a fragment, a title
  * or anything on the page. Nothing for a person who isn't signed in. Nothing is stored on the device.
  *
@@ -73,7 +74,7 @@ interface PageViewReport {
 }
 
 // One route of the app: its segments, each a fixed word, a parameter or a final catch-all.
-type Route = Array<{ word: string } | { param: true } | { rest: true }>;
+type Route = Array<{ word: string } | { param: true; id: boolean } | { rest: true }>;
 
 interface Call {
   method: string;
@@ -100,6 +101,11 @@ const PAGE_VIEWS_PER_MINUTE = 30;
 const MAX_ROUTES = 500;
 const WORD = /^[a-z0-9][a-z0-9_-]{0,39}$/;
 const TABLE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
+// A route parameter the app itself calls an id ("id", "taskId", "post_id", "uuid")...
+const ID_PARAM = /^(?:id|uuid|[A-Za-z][A-Za-z0-9]*(?:Id|ID|Uuid|UUID)|[a-z][a-z0-9]*_(?:id|uuid))$/;
+// ...whose value is a database id (UUID, number, ULID): only then is it sent, so the page names its
+// record. A name, a slug or a phone number never passes both.
+const RECORD_ID = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{1,19}|[0-9A-HJKMNP-TV-Z]{26})$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type Fetch = typeof fetch;
@@ -431,7 +437,10 @@ function routesOf(pages: unknown): Route[] | undefined {
     parts.forEach((part, i) => {
       const last = i === parts.length - 1;
       if (part === "*" || (part === "$" && last)) { if (last) route.push({ rest: true }); else ok = false; }
-      else if (/^(:|\$)[A-Za-z_]\w*\??$/.test(part) || /^\[[A-Za-z_]\w*\]$/.test(part)) route.push({ param: true });
+      else if (/^(?::|\$)([A-Za-z_]\w*)\??$/.test(part) || /^\[([A-Za-z_]\w*)\]$/.test(part)) {
+        const name = part.replace(/^[:$[]|[\]?]$/g, "");
+        route.push({ param: true, id: ID_PARAM.test(name) });
+      }
       else if (WORD.test(part.toLowerCase())) route.push({ word: part.toLowerCase() });
       else ok = false;
     });
@@ -441,9 +450,11 @@ function routesOf(pages: unknown): Route[] | undefined {
 }
 
 // The route a path matches, as a pattern ("/tasks/:id"), the most specific when several do; null
-// when none does. Only the route's own words ever leave, never a segment of the address.
+// when none does. Only the route's own words leave, and a record's id where the route says it is
+// one ("/tasks/b38a12a9-…"); never any other segment of the address.
 function pageOf(routes: Route[], pathname: string): string | null {
-  const parts = pathname.split("/").filter(Boolean).map((p) => p.toLowerCase());
+  const raw = pathname.split("/").filter(Boolean);
+  const parts = raw.map((p) => p.toLowerCase());
   let best: { pattern: string; score: number } | undefined;
   for (const route of routes) {
     let words = 0;
@@ -460,7 +471,11 @@ function pageOf(routes: Route[], pathname: string): string | null {
       }
     }
     if (!matched || (i < parts.length)) continue;
-    const pattern = "/" + route.map((seg) => ("word" in seg ? seg.word : "param" in seg ? ":id" : "*")).join("/");
+    const pattern = "/" + route.map((seg, k) => {
+      if ("word" in seg) return seg.word;
+      if ("param" in seg) return seg.id && RECORD_ID.test(raw[k]!) ? raw[k]! : ":id";
+      return "*";
+    }).join("/");
     // The most specific: a word beats a parameter, which beats a catch-all; an exact route beats one
     // ending in a catch-all ("/" over "/*", "/tasks/new" over "/tasks/:id" over "/tasks/*").
     const params = route.filter((seg) => "param" in seg).length;

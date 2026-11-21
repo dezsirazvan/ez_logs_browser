@@ -389,9 +389,9 @@ describe("@ezlogs/browser", () => {
       }
       await wait(6_000);
       await wait(1_100);
-      expect(views(fake).map((v: { page: string | null }) => v.page)).toEqual(["/board", "/tasks/:id", "/tasks/new", "/u/:id", null, "/files/*", null]);
+      expect(views(fake).map((v: { page: string | null }) => v.page)).toEqual(["/board", "/tasks/42", "/tasks/new", "/u/:id", null, "/files/*", null]);
       const sent = views(fake).map((v: { page: string | null; tables: string[] }) => [v.page, v.tables]);
-      expect(JSON.stringify(sent)).not.toMatch(/charles|42|pdf|Bad/);
+      expect(JSON.stringify(sent)).not.toMatch(/charles|pdf|Bad/);
       expect(JSON.stringify(fake.reports())).not.toMatch(/charles|b\.pdf|Bad Word/);
     });
 
@@ -433,8 +433,41 @@ describe("@ezlogs/browser", () => {
       fake.fire("visibilitychange");
       await settle();
       const [first, second] = views(fake);
-      expect(second.page).toBe("/tasks/:id");
+      expect(second.page).toBe("/tasks/7");
       expect(second.correlation_id).not.toBe(first.correlation_id);
+    });
+
+    it("names the record only where the route calls it an id and the value is a database id", async () => {
+      const uuid = "b38a12a9-4d9b-4d83-bda0-b3e19c03a236";
+      const ulid = "01HV9ZQK3M8X5T2N7B4C6D1E0F";
+      const fake = await setup(ok, { pages: ["/tasks/$taskId", "/projects/:project_id/tasks/:id", "/u/$name", "/call/:phone",
+                                              "/blog/[slug]", "/files/[id]", "/orders/:uuid"] });
+      await read(fake, "tasks");
+      const paths = [`/tasks/${uuid}`, "/tasks/my-first-task", `/projects/12/tasks/${uuid}`, "/u/123", "/call/0721234567",
+                     "/blog/how-we-work", `/files/${ulid}`, "/orders/not-an-id", `/tasks/${uuid.toUpperCase()}`];
+      for (const path of paths) {
+        fake.w.history.pushState({}, "", path);
+        await read(fake, "tasks");
+      }
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page).slice(1)).toEqual([
+        `/tasks/${uuid}`, "/tasks/:id", `/projects/12/tasks/${uuid}`, "/u/:id", "/call/:id", "/blog/:id", `/files/${ulid}`,
+        "/orders/:id", `/tasks/${uuid.toUpperCase()}`,
+      ]);
+      expect(JSON.stringify(fake.reports())).not.toMatch(/my-first-task|0721234567|how-we-work|not-an-id/);
+    });
+
+    it("counts another record on the same route as another page", async () => {
+      const fake = await setup(ok, { pages: ["/tasks/:id"] });
+      fake.w.history.pushState({}, "", "/tasks/1");
+      await read(fake, "tasks");
+      fake.w.history.pushState({}, "", "/tasks/2");
+      await read(fake, "tasks");
+      fake.w.history.replaceState({}, "", "/tasks/2?tab=comments");
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/tasks/1", "/tasks/2"]);
     });
 
     it("counts the same page once even after its first 5 seconds", async () => {
@@ -457,7 +490,7 @@ describe("@ezlogs/browser", () => {
       }
       await wait(6_000);
       await wait(1_100);
-      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/*", "/", "/tasks/:id", "/tasks/new", "/tasks/*", "/*"]);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/*", "/", "/tasks/7", "/tasks/new", "/tasks/*", "/*"]);
     });
 
     it("stops naming a person whose sign-out was refused or whose login is gone", async () => {
@@ -486,7 +519,7 @@ describe("@ezlogs/browser", () => {
       expect(fake.w.history.pushState({}, "", "/tasks/9")).toBe("kept");
       await wait(6_000);
       await wait(1_100);
-      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/board", "/tasks/:id"]);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/board", "/tasks/9"]);
     });
 
     it("ignores a route list that isn't one, and odd routes in it", async () => {

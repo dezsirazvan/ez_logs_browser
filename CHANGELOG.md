@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 (2026-11-21)
+
+- Page views name the record a page shows. Where your route calls a part an id (`:id`, `$taskId`,
+  `[post_id]`, `:uuid`) and its value is a database id (a UUID, a ULID or a number), that id is
+  sent (`/tasks/b38a12a9-…`), so EZLogs reads "Ana viewed task 'Launch plan'". Any other part
+  (`/u/$username`, `/blog/[slug]`, an id-named part holding a name) stays `:id`. A different
+  record on the same route is a new page view.
+
 ## 0.3.0 (2026-11-21)
 
 - Added: **page views**, only with the new `pages` option (your app's routes) and only while the
