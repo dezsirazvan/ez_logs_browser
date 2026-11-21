@@ -1,30 +1,33 @@
 /**
- * @ezlogs/browser: tells EZLogs when a call from your app to its Supabase backend fails, and
- * when someone signs out, so your activity log shows "Sign-in failed (wrong email or password)"
- * or "Task creation failed (it already exists)" next to everything your database records.
+ * @ezlogs/browser: tells EZLogs when a call from your app to its Supabase backend fails, so your
+ * activity log shows "Task creation failed (it already exists)" or "Sign-in failed (wrong email or
+ * password)" next to everything your database records.
  *
- *   // src/ezlogs.ts, imported first in src/main.tsx (`import "./ezlogs";`)
+ *   // src/ezlogs.ts, imported on the first line of the file that loads first in the browser
  *   import { init } from "@ezlogs/browser";
  *   init({ key: "ezlpub_…", supabaseUrl: import.meta.env.VITE_SUPABASE_URL });
  *
- * Imported first, so it runs before your Supabase client is created: some supabase-js versions
- * keep the `fetch` they find at that moment.
+ * What it sends, for a call to your Supabase project (database, files, accounts, functions) or to
+ * your app's own server functions (`/_serverFn/…`) that failed (status 400 or more, or no answer;
+ * a call your app cancelled is not a failure), and for a successful sign-out: the method, the
+ * table, function or bucket the call was for, the status, Supabase's error code, the time, the
+ * click's id (below) and the Supabase session id. Nothing else.
  *
- * What it does:
- * - watches only your app's calls to Supabase (database, files, accounts, functions) and its
- *   own TanStack server functions (`/_serverFn/…`);
- * - reports a call that failed (status 400 or more, or no answer; a call your app cancelled is
- *   not a failure) and a successful sign-out: method, the table, function or bucket the call was
- *   for (never the rest of the path: no file names, no ids, no query string), status, Supabase's
- *   error code and message, the login token the call carried (EZLogs checks it against your own
- *   project and never stores it), and for a failed sign-in the email that was typed;
- * - puts one `x-correlation-id` on the Supabase calls of the two seconds after a click, so the
- *   click's changes show as one action. Only after a first request proved your Supabase accepts
- *   that header.
+ * Who it was: the session id is the `session_id` field inside the call's own login token, read
+ * here; the token itself never leaves. A session id is not a credential (nothing can be opened
+ * with it), and EZLogs names the person only when your database recorded that session.
  *
- * What it never does: send request or response bodies, track clicks, page views or reads,
- * change what your app's calls return, or throw. If EZLogs is down, slow or blocked, your app
- * works exactly the same.
+ * What it never sends: login tokens or any other credential, emails, passwords, error messages,
+ * request or response bodies, query strings, file names. It never reads a request body.
+ *
+ * One click, one action: in the two seconds after a click, a form submit or Enter, it adds one
+ * `x-correlation-id` header to your app's Supabase calls, so EZLogs groups that click's changes and
+ * failures. Only after one request to your project's public settings endpoint (with your app's own
+ * public API key, sent only to your own project) proved your Supabase accepts that header, so an
+ * app call is never sent with a header it would refuse.
+ *
+ * It never throws, never changes or retries your app's calls, and does nothing on the server. If
+ * EZLogs is down, slow or blocked, your app works exactly the same.
  */
 
 export interface InitOptions {
@@ -42,20 +45,16 @@ interface Report {
   path: string;
   status: number;
   code?: string;
-  message?: string;
   correlation_id?: string;
+  session_id?: string;
   at: string;
-  token?: string;
-  email?: string;
 }
 
 interface Call {
   method: string;
   path: string;
   supabase: boolean;
-  token?: string;
-  apikey?: string;
-  email?: string;
+  sessionId?: string;
   correlationId?: string;
 }
 
@@ -69,8 +68,8 @@ const GESTURE_CALLS = 10;
 const REPEAT_MS = 10_000;
 const PER_MINUTE = 20;
 const MAX_BODY_BYTES = 15_000;
-const MAX_TOKEN_CHARS = 8_000;
 const STATE = Symbol.for("ezlogs.browser");
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type Fetch = typeof fetch;
 
@@ -119,7 +118,7 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string)
 
   // Stamp only once a request proved this Supabase answers one carrying the header (its CORS
   // allows it), so an app call is never sent with it before that and none is ever lost. Asked
-  // once, with the app's own public key from its first call, of an endpoint that answers 200.
+  // once, of the project's public settings endpoint (answers 200), with the app's own public key.
   const askOnce = (apikey: string) => {
     probe = "asking";
     send(`${supabaseOrigin}/auth/v1/settings`, { method: "GET", headers: { apikey, "x-correlation-id": correlationId() } })
@@ -130,12 +129,8 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string)
     timer = undefined;
     for (let posts = 0; queue.length > 0 && posts < (all ? 3 : 1); posts++) {
       const reports = queue.splice(0, 10);
-      let body = JSON.stringify({ key, reports });
-      while (body.length > MAX_BODY_BYTES && reports.length > 0) {
-        reports.pop();
-        body = JSON.stringify({ key, reports });
-      }
-      if (reports.length === 0) continue;
+      const body = JSON.stringify({ key, reports });
+      if (body.length > MAX_BODY_BYTES) continue; // cannot happen with these fields; never send more
       send(endpoint, { method: "POST", body, keepalive: true, credentials: "omit", mode: "cors",
                        headers: { "Content-Type": "text/plain" } }).catch(() => undefined);
     }
@@ -176,7 +171,10 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string)
     let args: [RequestInfo | URL, RequestInit | undefined] = [input, init];
     try {
       call = describe(w, supabaseOrigin, input, init);
-      if (call?.supabase && call.apikey && probe === "waiting") askOnce(call.apikey);
+      if (call?.supabase && probe === "waiting") {
+        const apikey = headersOf(input, init)?.get("apikey");
+        if (apikey && apikey.length <= 2_000) askOnce(apikey);
+      }
       const g = gesture && gesture.until > Date.now() && gesture.calls < GESTURE_CALLS ? gesture : undefined;
       if (call && g) {
         g.calls += 1;
@@ -200,7 +198,7 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string)
           try {
             // A call the app cancelled (navigation, unmount, abortSignal) is not a failure.
             if ((error as { name?: string })?.name === "AbortError" || init?.signal?.aborted) return;
-            report(failure(c, 0, undefined, undefined));
+            report(failure(c, 0, undefined));
           } catch {
             // never break the app
           }
@@ -221,6 +219,27 @@ function plain(init?: RequestInit): boolean {
   return h === undefined || Array.isArray(h) || h instanceof Headers || Object.getPrototypeOf(h) === Object.prototype;
 }
 
+// The call's headers, read without consuming them (undefined for anything unusual). Used for two
+// things only: the app's public `apikey`, for the one CORS check above to the app's own project,
+// and the session id inside the login token. Neither the key nor the token is ever sent to EZLogs.
+function headersOf(input: RequestInfo | URL, init?: RequestInit): Headers | undefined {
+  if (!plain(init)) return undefined;
+  return new Headers(init?.headers ?? (typeof input === "object" && "headers" in input ? (input as Request).headers : undefined));
+}
+
+// The `session_id` field of the call's login token (decoded here, never sent): Supabase's random
+// id for this sign-in, which EZLogs matches with the session your database recorded.
+function sessionIdOf(headers: Headers | undefined): string | undefined {
+  const payload = headers?.get("authorization")?.match(/^Bearer\s+[\w-]+\.([\w-]+)\.[\w-]*$/)?.[1];
+  if (!payload || payload.length > 8_000) return undefined;
+  try {
+    const sid = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))?.session_id;
+    return typeof sid === "string" && UUID.test(sid) ? sid.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function describe(w: Window, supabaseOrigin: string, input: RequestInfo | URL, init?: RequestInit): Call | undefined {
   const href = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url;
   const url = new URL(href, w.location?.href);
@@ -232,20 +251,8 @@ function describe(w: Window, supabaseOrigin: string, input: RequestInfo | URL, i
 
   const method = (init?.method || (typeof input === "object" && "method" in input ? (input as Request).method : "GET")).toUpperCase();
   const call: Call = { method, path: serverFunction ? "/_serverFn" : shortPath(url.pathname), supabase };
-  if (!supabase || !plain(init)) return call; // never read headers we could consume
-  const headers = new Headers(init?.headers ?? (typeof input === "object" && "headers" in input ? (input as Request).headers : undefined));
-  const bearer = headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-  if (bearer && bearer.split(".").length === 3 && bearer.length <= MAX_TOKEN_CHARS) call.token = bearer;
-  const apikey = headers.get("apikey");
-  if (apikey && apikey.length <= 2_000) call.apikey = apikey; // only for the one CORS check, never sent to EZLogs
-  if (url.pathname === "/auth/v1/token" && typeof init?.body === "string") {
-    try {
-      const email = JSON.parse(init.body)?.email;
-      if (typeof email === "string" && email.length <= 200) call.email = email;
-    } catch {
-      // not JSON: no email
-    }
-  }
+  const sessionId = supabase ? sessionIdOf(headersOf(input, init)) : undefined;
+  if (sessionId) call.sessionId = sessionId;
   return call;
 }
 
@@ -264,46 +271,34 @@ function shortPath(pathname: string): string {
 
 function onResponse(call: Call, response: Response, report: (r: Report) => void): void {
   if (call.path === "/auth/v1/logout" && response.ok) {
-    report({ kind: "sign_out", method: call.method, path: call.path, status: response.status, at: new Date().toISOString(),
-             correlation_id: call.correlationId, token: call.token });
+    if (call.sessionId) report({ ...failure(call, response.status, undefined), kind: "sign_out" });
     return;
   }
   if (response.status < 400) return;
   if (!call.supabase) {
-    report(failure(call, response.status, undefined, undefined));
+    report(failure(call, response.status, undefined));
     return;
   }
+  // Supabase's error code only ("23505", "invalid_credentials"): never its message, which can quote
+  // what was typed.
   response.clone().text().then((text) => {
     let code: string | undefined;
-    let message: string | undefined;
     try {
       const body = JSON.parse(text.slice(0, 4_000));
       code = [body?.error_code, body?.code].find((v) => typeof v === "string");
-      message = [body?.message, body?.msg, body?.error_description, body?.error].find((v) => typeof v === "string");
     } catch {
       // not JSON: status only
     }
     // `.single()` finding no row is how many apps ask "does it exist?", not a failure.
     if (response.status === 406 && code === "PGRST116") return;
-    // Postgres data errors (class 22) quote the value that was typed: the code says enough.
-    if (code?.startsWith("22")) message = undefined;
-    report(failure(call, response.status, code, message));
-  }).catch(() => report(failure(call, response.status, undefined, undefined)));
+    report(failure(call, response.status, code));
+  }).catch(() => report(failure(call, response.status, undefined)));
 }
 
-function failure(call: Call, status: number, code: string | undefined, message: string | undefined): Report {
-  return {
-    kind: "failure",
-    method: call.method,
-    path: call.path,
-    status,
-    code: code?.slice(0, 60),
-    message: message?.slice(0, 300),
-    correlation_id: call.correlationId,
-    at: new Date().toISOString(),
-    token: call.token,
-    email: call.path === "/auth/v1/token" ? call.email : undefined
-  };
+function failure(call: Call, status: number, code: string | undefined): Report {
+  const safeCode = code && /^[A-Za-z0-9_]{1,60}$/.test(code) ? code : undefined;
+  return { kind: "failure", method: call.method, path: call.path, status, code: safeCode, correlation_id: call.correlationId,
+           session_id: call.sessionId, at: new Date().toISOString() };
 }
 
 function correlationId(): string {

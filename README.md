@@ -1,15 +1,43 @@
 # @ezlogs/browser
 
 Tells [EZLogs](https://ezlogs.io) when a call from your app to its Supabase backend fails, and when
-someone signs out. Your EZLogs activity log then shows, next to every change your database records:
+someone signs out. Your EZLogs activity log then shows what failed for whom, next to every change
+your database records:
 
-- "Sign-in failed: tried to sign in as 'ana@example.com' (wrong email or password)"
+- "Sign-in failed (wrong email or password)"
 - "Task creation failed (it already exists)"
 - "Attachment upload failed (the file is too large)"
-- "Signed out"
 
 It works with any app on Supabase, including apps built with Lovable, Bolt and v0. Use it together
-with the EZLogs database install, which records what your app changed.
+with the EZLogs database install, which records what your app changed and who did it.
+
+## What it sends, and what it never sends
+
+| Sent, only for a call that failed or a sign-out | Never sent |
+|---|---|
+| the method (`POST`, `PATCH`, …) | login tokens or any other credential |
+| the table, function or bucket the call was for | emails, passwords, names, ids |
+| the status (`409`, or `0` when there was no answer) | error messages (they can quote what was typed) |
+| Supabase's error code (`23505`, `invalid_credentials`) | request or response bodies, query strings, file names |
+| the time, and the id of the click it belongs to | your Supabase API key |
+| the Supabase session id (below) | |
+
+It never reads a request body. Successful calls are not reported (except a sign-out), a call your
+app cancelled (navigation, unmount, an abort signal) is not a failure, and a session refresh failing
+and `.single()` finding no row are not reported either.
+
+**Who it was.** Supabase puts a random `session_id` inside each login token. The module reads that
+one field from the call's token, in the browser, and sends only it; the token never leaves. A
+session id is not a credential: nothing can be signed in to or opened with it. The EZLogs database
+install records each new session's id and user (`auth.sessions`: those two columns only), so EZLogs
+names the person only when your own database recorded that session. Otherwise the failure shows as
+"Someone", as does a failed sign-in (there is no session yet).
+
+**One click, one action.** In the two seconds after a click, a form submit or Enter, it adds one
+`x-correlation-id` header to your app's Supabase calls (at most 10, never to Edge Functions, which
+set their own CORS rules), so EZLogs groups everything that click changed and what failed. It does
+so only after one request to your project's public settings endpoint, with your app's own public
+API key and to your own project only, proved your Supabase accepts that header.
 
 ## Install
 
@@ -17,8 +45,9 @@ with the EZLogs database install, which records what your app changed.
 npm install @ezlogs/browser
 ```
 
-Put `init` in its own file and import that file first in your entry file, so it runs before your
-Supabase client is created (some supabase-js versions keep the `fetch` they find at that moment):
+Put `init` in its own file, and import that file on the first line of the file that loads first in
+the browser, so it runs before your Supabase client is created (some supabase-js versions keep the
+`fetch` they find at that moment):
 
 ```ts
 // src/ezlogs.ts
@@ -27,41 +56,18 @@ import { init } from "@ezlogs/browser";
 init({ key: "ezlpub_…", supabaseUrl: import.meta.env.VITE_SUPABASE_URL });
 ```
 
-```ts
-// src/main.tsx: the first line
-import "./ezlogs";
-```
-
-In a Next.js app use `process.env.NEXT_PUBLIC_SUPABASE_URL` and import it first in a client
-component that wraps your app.
+| App | First line of |
+|---|---|
+| TanStack Start (Lovable's current template) | `src/routes/__root.tsx`: `import "../ezlogs";` |
+| Vite with `src/main.tsx` | `src/main.tsx`: `import "./ezlogs";` |
+| Next.js | a `"use client"` component rendered first in the root layout (use `process.env.NEXT_PUBLIC_SUPABASE_URL`) |
 
 Your browser key is on the EZLogs install page. It is public by design (it sits in your app's
 JavaScript): it can only send failure reports, never read anything.
 
-## What it sends
-
-For a call to your Supabase project (database, files, accounts, functions) or to your app's own
-server functions (`/_serverFn/…`) that failed, or a successful sign-out:
-
-| Sent | Never sent |
-|---|---|
-| method, and the table, function or bucket the call was for | the rest of the path: file names, ids, the query string |
-| status, Supabase's error code and message (a message that quotes a typed value is left out) | request or response bodies, `details`, `hint` |
-| the login token the call carried, so EZLogs can say who it was | passwords |
-| for a failed sign-in, the email that was typed | your Supabase API key |
-
-EZLogs checks the login token against your own Supabase project only and never stores it. A failure
-without a valid login shows as "Someone".
-
-It also puts one `x-correlation-id` header on your app's Supabase calls in the two seconds after a
-click, a form submit or Enter (at most 10 calls), so everything one click changed shows as one
-action. It does so only after one request to your project's public settings endpoint proved your
-Supabase accepts that header, and never on Edge Functions, which set their own CORS rules.
-
 ## What it never does
 
 - Track clicks, page views or reads.
-- Report a call your app cancelled (navigation, unmount, an abort signal).
 - Change what your app's calls return, or retry them.
 - Throw. If EZLogs is down, slow or blocked by an ad blocker, your app works exactly the same.
 - Run on the server: `init` does nothing outside a browser.

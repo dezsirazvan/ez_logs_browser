@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 (2026-11-21)
+
+Sends no credential and nothing typed. **Upgrade from 0.1.0.**
+
+- Removed: the login token. 0.1.0 sent it so EZLogs could name the person; a live token is a
+  credential, and no app should have to trust a third party with it. Now only the token's
+  `session_id` field is sent (read in the browser; not a credential), and EZLogs names the person
+  only when your database recorded that session (EZLogs database install 1.3.0).
+- Removed: the email typed into a failed sign-in, and Supabase's error message (it can quote what
+  was typed). Only Supabase's error code is sent.
+- A sign-out is reported only with a session id.
+
 ## 0.1.0 (2026-11-21)
 
 First release.

@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const SUPABASE = "https://abc.supabase.co";
 const ENDPOINT = "https://ezlogs.test/api/ingest/browser";
-const TOKEN = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ1MSJ9.sig";
+const SESSION = "5e55e55e-1111-4222-8333-944455556666";
+const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+const TOKEN = `${b64({ alg: "ES256" })}.${b64({ sub: "u1", email: "dana@example.com", session_id: SESSION })}.c2lnbmF0dXJl`;
 const SETTINGS = `${SUPABASE}/auth/v1/settings`;
 
 type Handler = (url: string, init?: RequestInit) => Promise<Response>;
@@ -71,7 +73,7 @@ describe("@ezlogs/browser", () => {
     await settle();
   }
 
-  it("reports a failed Supabase call with its code, message and login, and returns the app's response untouched", async () => {
+  it("reports a failed Supabase call with its code only, and returns the app's response untouched", async () => {
     const fake = await setup(async (url) =>
       settingsOk(url) ?? (url.startsWith(`${SUPABASE}/rest/v1/tasks`) ?
         json(409, { code: "23505", message: "duplicate key", details: "Key (title)=(Secret)" }) : new Response(null, { status: 202 })));
@@ -84,11 +86,14 @@ describe("@ezlogs/browser", () => {
     await flush();
 
     const [r] = fake.reports();
-    expect(r).toMatchObject({ kind: "failure", method: "POST", path: "/rest/v1/tasks", status: 409, code: "23505",
-                              message: "duplicate key", token: TOKEN });
+    expect(r).toEqual({ kind: "failure", method: "POST", path: "/rest/v1/tasks", status: 409, code: "23505", session_id: SESSION,
+                        at: expect.any(String) });
     const sent = JSON.stringify(fake.reports());
     expect(sent).not.toContain("Secret"); // never the query string, the body or `details`
-    expect(sent).not.toContain("anon-key"); // the app's API key never leaves for EZLogs
+    expect(sent).not.toContain("duplicate key"); // never Supabase's message
+    expect(sent).not.toContain(TOKEN.split(".")[1]); // never the login token, nor any part of it
+    expect(sent).not.toContain("dana@example.com"); // nor what is inside it besides the session id
+    expect(sent).not.toContain("anon-key"); // never the app's API key
     const post = fake.appCalls(ENDPOINT)[0]!;
     expect(post.init).toMatchObject({ method: "POST", keepalive: true, credentials: "omit", headers: { "Content-Type": "text/plain" } });
     expect(JSON.parse(String(post.init?.body)).key).toBe("ezlpub_test");
@@ -135,24 +140,26 @@ describe("@ezlogs/browser", () => {
     expect(fake.reports()).toEqual([]);
   });
 
-  it("reports a failed sign-in with the typed email, never the password", async () => {
+  it("reports a failed sign-in by its code: never the email, the password or the message", async () => {
     const fake = await setup(async (url) =>
       url.includes("/auth/v1/token") ? json(400, { code: 400, error_code: "invalid_credentials", msg: "Invalid login credentials" }) : json(200, {}));
     await fake.w.fetch(`${SUPABASE}/auth/v1/token?grant_type=password`, {
       method: "POST", body: JSON.stringify({ email: "ana@example.com", password: "hunter2" })
     });
     await flush();
-    expect(fake.reports()[0]).toMatchObject({ path: "/auth/v1/token", status: 400, code: "invalid_credentials",
-                                              message: "Invalid login credentials", email: "ana@example.com" });
-    expect(JSON.stringify(fake.reports())).not.toContain("hunter2");
+    expect(fake.reports()[0]).toEqual({ kind: "failure", method: "POST", path: "/auth/v1/token", status: 400, code: "invalid_credentials",
+                                        at: expect.any(String) });
+    expect(JSON.stringify(fake.reports())).not.toMatch(/hunter2|ana@example\.com|Invalid login/);
   });
 
-  it("leaves out a Postgres data error's message, which quotes the typed value", async () => {
-    const fake = await setup(async () => json(400, { code: "22P02", message: 'invalid input syntax for type uuid: "my secret note"' }));
+  it("never sends an error message, which can quote what was typed, nor an odd code", async () => {
+    const fake = await setup(async (url) => (url.includes("tasks") ? json(400, { code: "22P02", message: 'invalid input syntax: "my secret note"' }) :
+      json(400, { code: "my secret note" })));
     await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "PATCH" });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/notes`, { method: "PATCH" });
     await flush();
-    expect(fake.reports()[0]).toMatchObject({ code: "22P02" });
-    expect(fake.reports()[0].message).toBeUndefined();
+    expect(fake.reports().map((r) => r.code).sort()).toEqual(["22P02", undefined]);
+    expect(JSON.stringify(fake.reports())).not.toContain("secret");
   });
 
   it("never reports a session refresh failing, or .single() finding no row", async () => {
@@ -165,19 +172,33 @@ describe("@ezlogs/browser", () => {
     expect(fake.reports()).toEqual([]);
   });
 
-  it("reports a successful sign-out with the login it ended", async () => {
+  it("reports a successful sign-out with its session id only, and no other success", async () => {
     const fake = await setup(async (url) => new Response(null, { status: url.includes("logout") ? 204 : 200 }));
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
     await fake.w.fetch(`${SUPABASE}/auth/v1/logout?scope=global`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+    await fake.w.fetch(`${SUPABASE}/auth/v1/logout`, { method: "POST" }); // no session: nothing to name
     await flush();
-    expect(fake.reports()[0]).toMatchObject({ kind: "sign_out", path: "/auth/v1/logout", status: 204, token: TOKEN });
+    expect(fake.reports()).toEqual([{ kind: "sign_out", method: "POST", path: "/auth/v1/logout", status: 204, session_id: SESSION,
+                                      at: expect.any(String) }]);
+    expect(JSON.stringify(fake.reports())).not.toContain(TOKEN.split(".")[1]);
   });
 
-  it("reports the app's own server functions failing, without a login", async () => {
+  it("takes only a well-formed session id from the token, and nothing from an odd or anonymous one", async () => {
+    const fake = await setup(async () => json(500, {}));
+    const anon = `${b64({ alg: "HS256" })}.${b64({ role: "anon" })}.sig`;
+    const odd = `${b64({ alg: "ES256" })}.${b64({ session_id: "not-a-uuid" })}.sig`;
+    await fake.w.fetch(`${SUPABASE}/rest/v1/a`, { method: "POST", headers: { Authorization: `Bearer ${anon}` } });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/b`, { method: "POST", headers: { Authorization: `Bearer ${odd}` } });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/c`, { method: "POST", headers: { Authorization: "Bearer garbage" } });
+    await flush();
+    expect(fake.reports().map((r) => r.session_id)).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("reports the app's own server functions failing, without anything about the person", async () => {
     const fake = await setup(async () => new Response(null, { status: 500 }));
     await fake.w.fetch("/_serverFn/89b33048", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
     await flush();
-    expect(fake.reports()[0]).toMatchObject({ path: "/_serverFn", status: 500 });
-    expect(fake.reports()[0].token).toBeUndefined();
+    expect(fake.reports()[0]).toEqual({ kind: "failure", method: "POST", path: "/_serverFn", status: 500, at: expect.any(String) });
   });
 
   it("asks once, with the app's own key, whether Supabase accepts the header, then stamps one id per click", async () => {
@@ -207,6 +228,19 @@ describe("@ezlogs/browser", () => {
     vi.advanceTimersByTime(2_500);
     await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
     expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toBeNull(); // the click is over
+  });
+
+  it("gives a failure the id of its click, the one the click's other Supabase calls carried", async () => {
+    const fake = await setup(async (url) => settingsOk(url) ?? (url.includes("tasks") ? json(201, {}) : json(409, { code: "23505" })));
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    fake.fire("click");
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tags`, { method: "POST" });
+    await flush();
+    const stamped = header(fake.appCalls(`${SUPABASE}/rest/v1/tasks`)[0]!.init, "x-correlation-id");
+    expect(stamped).toMatch(/^ezl_/);
+    expect(fake.reports().at(-1)).toMatchObject({ path: "/rest/v1/tags", correlation_id: stamped });
   });
 
   it("stamps at most 10 calls of one click", async () => {
@@ -264,7 +298,7 @@ describe("@ezlogs/browser", () => {
     expect(fake.reports()).toHaveLength(20);
   });
 
-  it("sends what waits when the page is hidden, and never lets an oversized report block the rest", async () => {
+  it("sends what waits when the page is hidden", async () => {
     const fake = await setup(async (url) => (url === ENDPOINT ? new Response(null, { status: 202 }) : json(500, { message: "x".repeat(300) })));
     for (let i = 0; i < 12; i++) await fake.w.fetch(`${SUPABASE}/rest/v1/table_${i}`, { method: "POST" });
     await settle();
