@@ -66,6 +66,17 @@ If your `package.json` has `"sideEffects": false` (Lovable's template does), lis
 for example `"sideEffects": ["./src/ezlogs.ts"]`. Otherwise the build drops `import "./ezlogs";`
 because it imports no names. To check, search the built JavaScript for your key.
 
+So that later edits (yours or your AI builder's) keep it working, add a note to `AGENTS.md`, which
+Lovable, Cursor and Codex read:
+
+```md
+## EZLogs
+- `src/ezlogs.ts` and its import on the first line of `src/routes/__root.tsx` report failed calls to EZLogs.
+  Keep both, and keep that import first.
+- Keep `./src/ezlogs.ts` listed in package.json "sideEffects", if that field exists.
+- The database's `ezlogs` schema records the activity log: never drop or change it in a migration.
+```
+
 Your browser key is on the EZLogs install page. It is public by design (it sits in your app's
 JavaScript): it can only send failure reports, never read anything.
 
