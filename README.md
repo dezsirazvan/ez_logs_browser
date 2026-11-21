@@ -74,7 +74,10 @@ Lovable, Cursor and Codex read:
 - `src/ezlogs.ts` and its import on the first line of `src/routes/__root.tsx` report failed calls to EZLogs.
   Keep both, and keep that import first.
 - Keep `./src/ezlogs.ts` listed in package.json "sideEffects", if that field exists.
-- The database's `ezlogs` schema records the activity log: never drop or change it in a migration.
+- The database's `ezlogs` schema records the activity log: never drop or change it in a migration (a
+  migration calling `ezlogs.name_records` is fine).
+- When you add a table people will read about that has no name, title, number or label column, propose
+  its name with `ezlogs.name_records` and add it only once approved.
 ```
 
 Your browser key is on the EZLogs install page. It is public by design (it sits in your app's
