@@ -62,6 +62,10 @@ init({ key: "ezlpub_…", supabaseUrl: import.meta.env.VITE_SUPABASE_URL });
 | Vite with `src/main.tsx` | `src/main.tsx`: `import "./ezlogs";` |
 | Next.js | a `"use client"` component rendered first in the root layout (use `process.env.NEXT_PUBLIC_SUPABASE_URL`) |
 
+If your `package.json` has `"sideEffects": false` (Lovable's template does), list that file instead,
+for example `"sideEffects": ["./src/ezlogs.ts"]`. Otherwise the build drops `import "./ezlogs";`
+because it imports no names. To check, search the built JavaScript for your key.
+
 Your browser key is on the EZLogs install page. It is public by design (it sits in your app's
 JavaScript): it can only send failure reports, never read anything.
 
