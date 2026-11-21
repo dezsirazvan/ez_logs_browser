@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 (2026-11-21)
+
+- Added: **page views**, only with the new `pages` option (your app's routes) and only while the
+  app's owner has page views on in EZLogs. For a signed-in person: the page they opened as the
+  matching route (`/tasks/:id`; an address no route matches is "a page"), and the tables it read in
+  its first 5 seconds (names only). No query string, title or content; nothing for visitors who
+  aren't signed in; nothing stored on the device. At most 30 a minute. Without `pages`, nothing
+  changes from 0.2.0.
+
 ## 0.2.0 (2026-11-21)
 
 Sends no credential and nothing typed. **Upgrade from 0.1.0.**

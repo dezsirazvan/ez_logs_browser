@@ -23,7 +23,15 @@ function fakeWindow(handler: Handler) {
       calls.push({ url, init, input });
       return handler(url, init);
     }),
-    location: { href: "https://app.example.com/board", origin: "https://app.example.com" },
+    location: { href: "https://app.example.com/board", origin: "https://app.example.com", pathname: "/board", hash: "" },
+    history: {
+      pushState(_s: unknown, _t: string, url?: string) {
+        if (url === "/boom") throw new Error("the app's own error");
+        if (url) w.location.pathname = new URL(url, w.location.href).pathname;
+        return "kept";
+      },
+      replaceState(_s: unknown, _t: string, url?: string) { if (url) w.location.pathname = new URL(url, w.location.href).pathname; },
+    },
     document: doc,
     addEventListener: (type: string, fn: (e: unknown) => void) => { (listeners[type] ??= []).push(fn); },
   };
@@ -58,11 +66,11 @@ describe("@ezlogs/browser", () => {
     delete (globalThis as { window?: unknown }).window;
   });
 
-  async function setup(handler: Handler) {
+  async function setup(handler: Handler, options: { pages?: string[] } = {}) {
     const fake = fakeWindow(handler);
     (globalThis as { window?: unknown }).window = fake.w;
     const { init } = await load();
-    init({ key: "ezlpub_test", supabaseUrl: SUPABASE, endpoint: ENDPOINT });
+    init({ key: "ezlpub_test", supabaseUrl: SUPABASE, endpoint: ENDPOINT, ...options });
     await settle();
     return fake;
   }
@@ -335,5 +343,169 @@ describe("@ezlogs/browser", () => {
     const patched = fake.w.fetch;
     init({ key: "ezlpub_x", supabaseUrl: SUPABASE });
     expect(fake.w.fetch).toBe(patched);
+  });
+  describe("page views (pages)", () => {
+    const PAGES = ["/", "/board", "/tasks", "/tasks/:id", "/tasks/new", "/files/*", "/u/$name", "not a route", "/a/Bad Word"];
+    const ok = async (url: string) => settingsOk(url) ?? json(200, []);
+    const read = (fake: ReturnType<typeof fakeWindow>, table: string) =>
+      fake.w.fetch(`${SUPABASE}/rest/v1/${table}?select=*&id=eq.42`, { headers: { Authorization: `Bearer ${TOKEN}`, apikey: "anon" } });
+    const views = (fake: ReturnType<typeof fakeWindow>) => fake.reports().filter((r: { kind: string }) => r.kind === "page_view");
+    async function wait(ms: number) {
+      await settle();
+      vi.advanceTimersByTime(ms);
+      await settle();
+    }
+
+    it("records nothing about pages without a route list, and leaves history alone", async () => {
+      const fake = await setup(ok);
+      const push = fake.w.history.pushState;
+      await read(fake, "tasks");
+      await wait(6_000);
+      expect(views(fake)).toEqual([]);
+      expect(fake.w.history.pushState).toBe(push);
+    });
+
+    it("records the page a signed-in person opened, by its route, with the tables it read first", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await read(fake, "tasks");
+      await read(fake, "profiles");
+      await read(fake, "tasks");
+      await wait(6_000); // the first 5 s close the view; the queue sends a second later
+      await wait(1_100);
+      const [v] = views(fake);
+      expect(v).toEqual({ kind: "page_view", page: "/board", tables: ["tasks", "profiles"], correlation_id: expect.stringMatching(/^ezl_\d{13}_[0-9a-f]{8}$/),
+                          session_id: SESSION, at: expect.any(String) });
+      await read(fake, "late_table"); // after the first 5 s: not the page's
+      await wait(10_000);
+      expect(views(fake)).toHaveLength(1);
+    });
+
+    it("names a page only by the route list: an address it doesn't list is just a page", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await read(fake, "tasks");
+      for (const path of ["/tasks/42", "/tasks/new", "/u/charles", "/u/charles/settings", "/files/a/b.pdf", "/Bad Word"]) {
+        fake.w.history.pushState({}, "", path);
+        await read(fake, "tasks");
+      }
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string | null }) => v.page)).toEqual(["/board", "/tasks/:id", "/tasks/new", "/u/:id", null, "/files/*", null]);
+      const sent = views(fake).map((v: { page: string | null; tables: string[] }) => [v.page, v.tables]);
+      expect(JSON.stringify(sent)).not.toMatch(/charles|42|pdf|Bad/);
+      expect(JSON.stringify(fake.reports())).not.toMatch(/charles|b\.pdf|Bad Word/);
+    });
+
+    it("counts the same page once (a filter or a replaceState), and a route change through popstate", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await read(fake, "tasks");
+      fake.w.history.replaceState({}, "", "/board?filter=mine");
+      fake.w.history.pushState({}, "", "/tasks");
+      fake.w.location.pathname = "/board";
+      fake.fire("popstate");
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/board", "/tasks", "/board"]);
+    });
+
+    it("never records a person who isn't signed in, and stops at a sign-out", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { headers: { apikey: "anon" } }); // no login
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake)).toEqual([]);
+
+      fake.w.history.pushState({}, "", "/tasks");
+      await read(fake, "tasks");
+      await fake.w.fetch(`${SUPABASE}/auth/v1/logout`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}`, apikey: "anon" } });
+      fake.w.history.pushState({}, "", "/");
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/tasks"]);
+    });
+
+    it("joins the click that opened the page, and sends what waits when the page is hidden", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await read(fake, "tasks");
+      fake.fire("click");
+      fake.w.history.pushState({}, "", "/tasks/7");
+      await read(fake, "tasks");
+      fake.doc.visibilityState = "hidden";
+      fake.fire("visibilitychange");
+      await settle();
+      const [first, second] = views(fake);
+      expect(second.page).toBe("/tasks/:id");
+      expect(second.correlation_id).not.toBe(first.correlation_id);
+    });
+
+    it("counts the same page once even after its first 5 seconds", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await read(fake, "tasks");
+      await wait(6_000);
+      fake.w.history.replaceState({}, "", "/board?sort=new");
+      fake.w.history.pushState({}, "", "/board");
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake)).toHaveLength(1);
+    });
+
+    it("picks the most specific route: a word over a parameter over a catch-all, an exact route over a catch-all", async () => {
+      const fake = await setup(ok, { pages: ["/*", "/tasks/*", "/tasks/:id", "/tasks/new", "/"] });
+      await read(fake, "tasks");
+      for (const path of ["/", "/tasks/7", "/tasks/new", "/tasks/7/edit", "/other"]) {
+        fake.w.history.pushState({}, "", path);
+        await read(fake, "tasks");
+      }
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/*", "/", "/tasks/:id", "/tasks/new", "/tasks/*", "/*"]);
+    });
+
+    it("stops naming a person whose sign-out was refused or whose login is gone", async () => {
+      const fake = await setup(async (url) => settingsOk(url) ?? (url.endsWith("/logout") ? json(401, {}) : json(200, [])), { pages: PAGES });
+      await read(fake, "tasks");
+      await fake.w.fetch(`${SUPABASE}/auth/v1/logout`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      fake.w.history.pushState({}, "", "/tasks");
+      await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { headers: { apikey: "anon" } }); // signed out now
+      fake.w.history.pushState({}, "", "/settings");
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/board"]);
+    });
+
+    it("reads a hash router's path, and leaves the app's history calls exactly as they were", async () => {
+      const fake = await setup(ok, { pages: PAGES });
+      await read(fake, "tasks");
+      fake.w.location.hash = "#/tasks/9?tab=x";
+      fake.fire("hashchange");
+      await read(fake, "tasks");
+      const wrapped = fake.w.history.pushState;
+      const { init } = await import("../src/index"); // a second init changes nothing
+      init({ key: "ezlpub_test", supabaseUrl: SUPABASE, endpoint: ENDPOINT, pages: PAGES });
+      expect(fake.w.history.pushState).toBe(wrapped);
+      expect(() => fake.w.history.pushState({}, "", "/boom")).toThrow("the app's own error");
+      expect(fake.w.history.pushState({}, "", "/tasks/9")).toBe("kept");
+      await wait(6_000);
+      await wait(1_100);
+      expect(views(fake).map((v: { page: string }) => v.page)).toEqual(["/board", "/tasks/:id"]);
+    });
+
+    it("ignores a route list that isn't one, and odd routes in it", async () => {
+      const fake = await setup(ok, { pages: "/tasks" as unknown as string[] });
+      const push = fake.w.history.pushState;
+      await read(fake, "tasks");
+      await wait(7_000);
+      expect(views(fake)).toEqual([]);
+      expect(fake.w.history.pushState).toBe(push);
+    });
+
+    it("sends at most 30 page views a minute, apart from failures", async () => {
+      const fake = await setup(async (url) => settingsOk(url) ?? (url.includes("/boom") ? json(500, {}) : json(200, [])), { pages: PAGES });
+      await read(fake, "tasks");
+      for (let i = 0; i < 40; i++) fake.w.history.pushState({}, "", i % 2 ? "/tasks" : "/board");
+      await fake.w.fetch(`${SUPABASE}/rest/v1/boom`, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      for (let i = 0; i < 6; i++) await wait(1_100);
+      expect(views(fake)).toHaveLength(30);
+      expect(fake.reports().filter((r: { kind: string }) => r.kind === "failure")).toHaveLength(1);
+    });
   });
 });

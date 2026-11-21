@@ -26,6 +26,12 @@
  * public API key, sent only to your own project) proved your Supabase accepts that header, so an
  * app call is never sent with a header it would refuse.
  *
+ * Page views (only with `pages`, when the app's owner turned them on in EZLogs): which page a
+ * signed-in person opened, named only by the route list you pass (`["/tasks", "/tasks/:id"]`):
+ * a page not in it is sent as "a page", never its address. With it, the tables that page read in
+ * its first 5 seconds (names only, never what was read). Never a query string, a fragment, a title
+ * or anything on the page. Nothing for a person who isn't signed in. Nothing is stored on the device.
+ *
  * It never throws, never changes or retries your app's calls, and does nothing on the server. If
  * EZLogs is down, slow or blocked, your app works exactly the same.
  */
@@ -35,6 +41,13 @@ export interface InitOptions {
   key: string;
   /** Your Supabase project URL, as your Supabase client uses it. */
   supabaseUrl: string;
+  /**
+   * Page views (version 0.3.0): your app's page routes, as patterns: fixed parts as written, each
+   * changing part as `:name` (`$name` and `[name]` work too), a catch-all as `*`. Only these name a
+   * page; leave it out and no page view is ever recorded. EZLogs records them only while the
+   * app's owner has page views on.
+   */
+  pages?: string[];
   /** Where reports go. Only for tests. */
   endpoint?: string;
 }
@@ -49,6 +62,18 @@ interface Report {
   session_id?: string;
   at: string;
 }
+
+interface PageViewReport {
+  kind: "page_view";
+  page: string | null;
+  tables: string[];
+  correlation_id: string;
+  session_id: string;
+  at: string;
+}
+
+// One route of the app: its segments, each a fixed word, a parameter or a final catch-all.
+type Route = Array<{ word: string } | { param: true } | { rest: true }>;
 
 interface Call {
   method: string;
@@ -69,6 +94,12 @@ const REPEAT_MS = 10_000;
 const PER_MINUTE = 20;
 const MAX_BODY_BYTES = 15_000;
 const STATE = Symbol.for("ezlogs.browser");
+const PAGE_READS_MS = 5_000;
+const PAGE_TABLES = 10;
+const PAGE_VIEWS_PER_MINUTE = 30;
+const MAX_ROUTES = 500;
+const WORD = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+const TABLE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type Fetch = typeof fetch;
@@ -82,16 +113,16 @@ export function init(options: InitOptions): void {
     const supabase = new URL(String(options?.supabaseUrl ?? ""));
     if (!key.startsWith("ezlpub_") || !/^https?:$/.test(supabase.protocol)) return;
     w[STATE] = true;
-    start(w, key, supabase.origin, options.endpoint || DEFAULT_ENDPOINT);
+    start(w, key, supabase.origin, options.endpoint || DEFAULT_ENDPOINT, routesOf(options.pages));
   } catch {
     // never break the app
   }
 }
 
-function start(w: Window, key: string, supabaseOrigin: string, endpoint: string): void {
+function start(w: Window, key: string, supabaseOrigin: string, endpoint: string, routes: Route[] | undefined): void {
   const original: Fetch = w.fetch;
   const send: Fetch = (...args) => original.apply(w, args);
-  const queue: Report[] = [];
+  const queue: Array<Report | PageViewReport> = [];
   const recent = new Map<string, number>();
   let sentThisMinute = 0;
   let minuteStart = Date.now();
@@ -150,9 +181,82 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string)
     timer ??= setTimeout(flush, 1_000);
   };
 
+  // Page views: the open view collects the tables read in its first seconds, then is queued.
+  let view: { page: string | null; id: string; tables: Set<string>; session?: string; until: number; timer?: ReturnType<typeof setTimeout> } | undefined;
+  let lastSession: string | undefined;
+  let lastPage: string | null | undefined; // the page of the newest view, open or sent
+  let viewsThisMinute = 0;
+  let viewsMinuteStart = Date.now();
+  const closeView = () => {
+    const v = view;
+    view = undefined;
+    if (!v) return;
+    if (v.timer) clearTimeout(v.timer);
+    const session = v.session;
+    if (!session) return; // not signed in, or unknown: never recorded
+    const now = Date.now();
+    if (now - viewsMinuteStart > 60_000) { viewsMinuteStart = now; viewsThisMinute = 0; }
+    if (viewsThisMinute >= PAGE_VIEWS_PER_MINUTE) return;
+    viewsThisMinute += 1;
+    queue.push({ kind: "page_view", page: v.page, tables: [...v.tables], correlation_id: v.id, session_id: session,
+                 at: new Date(v.until - PAGE_READS_MS).toISOString() });
+    timer ??= setTimeout(flush, 1_000);
+  };
+  const openView = () => {
+    if (!routes) return;
+    const page = pageOf(routes, pathOf(w));
+    if (page === lastPage) return; // the same page again (a filter, a replaceState, a hash)
+    lastPage = page;
+    closeView();
+    const g = gesture && gesture.until > Date.now() ? gesture : undefined;
+    const until = Date.now() + PAGE_READS_MS;
+    // The person signed in while the page was open: who was at its start, or whose login its reads carried.
+    view = { page, id: g ? g.id : correlationId(), tables: new Set(), until, session: lastSession };
+    view.timer = setTimeout(() => { try { closeView(); } catch { /* never break the app */ } }, PAGE_READS_MS);
+  };
+  // Who is signed in now, from what Supabase last accepted: a call with a person's login sets it,
+  // one without (signed out, anonymous) clears it, as do a sign-out and a refused login. A table
+  // refusing a signed-in person (its access rules) is not the session ending.
+  const onAnswer = (call: Call, status: number) => {
+    if (call.path === "/auth/v1/logout" || (call.path.startsWith("/auth/v1/") && (status === 401 || status === 403))) {
+      lastSession = undefined;
+      return;
+    }
+    if (status < 200 || status >= 300) return;
+    lastSession = call.sessionId;
+    onRead(call);
+  };
+  const onRead = (call: Call) => {
+    const v = view;
+    if (!v || Date.now() > v.until) return;
+    if (call.sessionId) v.session = call.sessionId;
+    if (call.method !== "GET") return;
+    const table = call.path.match(/^\/rest\/v1\/([^/]+)$/)?.[1];
+    if (table && TABLE.test(table) && v.tables.size < PAGE_TABLES) v.tables.add(table);
+  };
+  if (routes) {
+    try {
+      const history = w.history;
+      for (const name of ["pushState", "replaceState"] as const) {
+        const originalMethod = history[name];
+        history[name] = function (this: History, ...args: Parameters<History["pushState"]>) {
+          const result = originalMethod.apply(this, args);
+          try { openView(); } catch { /* never break the app */ }
+          return result;
+        };
+      }
+      w.addEventListener("popstate", () => { try { openView(); } catch { /* fine */ } });
+      w.addEventListener("hashchange", () => { try { openView(); } catch { /* fine */ } });
+      openView();
+    } catch {
+      // no history: no page views
+    }
+  }
+
   // Leaving or hiding the page (mobile browsers often never fire pagehide): send what waits.
   const leave = () => {
     try {
+      closeView();
       if (timer) clearTimeout(timer);
       flush(true);
     } catch {
@@ -193,7 +297,14 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string)
     if (call) {
       const c = call;
       result.then(
-        (response) => { try { onResponse(c, response, report); } catch { /* never break the app */ } },
+        (response) => {
+          try {
+            if (c.supabase) onAnswer(c, response.status);
+            onResponse(c, response, report);
+          } catch {
+            // never break the app
+          }
+        },
         (error: unknown) => {
           try {
             // A call the app cancelled (navigation, unmount, abortSignal) is not a failure.
@@ -249,7 +360,8 @@ function describe(w: Window, supabaseOrigin: string, input: RequestInfo | URL, i
   // A refresh of an expired session failing is the session ending, not something the person did.
   if (url.pathname === "/auth/v1/token" && url.searchParams.get("grant_type") === "refresh_token") return undefined;
 
-  const method = (init?.method || (typeof input === "object" && "method" in input ? (input as Request).method : "GET")).toUpperCase();
+  const method = String(init?.method || (typeof input === "object" && "method" in input ? (input as Request).method : "GET")).toUpperCase();
+  if (!/^[A-Z]{1,10}$/.test(method)) return undefined; // nothing odd ever goes into a report
   const call: Call = { method, path: serverFunction ? "/_serverFn" : shortPath(url.pathname), supabase };
   const sessionId = supabase ? sessionIdOf(headersOf(input, init)) : undefined;
   if (sessionId) call.sessionId = sessionId;
@@ -305,4 +417,62 @@ function correlationId(): string {
   const bytes = new Uint8Array(4);
   globalThis.crypto.getRandomValues(bytes);
   return `ezl_${Date.now()}_${Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+// The app's routes, as given in `pages`: anything odd in it is skipped, never guessed.
+function routesOf(pages: unknown): Route[] | undefined {
+  if (!Array.isArray(pages)) return undefined;
+  const routes: Route[] = [];
+  for (const page of pages.slice(0, MAX_ROUTES)) {
+    if (typeof page !== "string" || !page.startsWith("/")) continue;
+    const parts = page.split("/").filter(Boolean);
+    const route: Route = [];
+    let ok = parts.length <= 8;
+    parts.forEach((part, i) => {
+      const last = i === parts.length - 1;
+      if (part === "*" || (part === "$" && last)) { if (last) route.push({ rest: true }); else ok = false; }
+      else if (/^(:|\$)[A-Za-z_]\w*\??$/.test(part) || /^\[[A-Za-z_]\w*\]$/.test(part)) route.push({ param: true });
+      else if (WORD.test(part.toLowerCase())) route.push({ word: part.toLowerCase() });
+      else ok = false;
+    });
+    if (ok) routes.push(route);
+  }
+  return routes;
+}
+
+// The route a path matches, as a pattern ("/tasks/:id"), the most specific when several do; null
+// when none does. Only the route's own words ever leave, never a segment of the address.
+function pageOf(routes: Route[], pathname: string): string | null {
+  const parts = pathname.split("/").filter(Boolean).map((p) => p.toLowerCase());
+  let best: { pattern: string; score: number } | undefined;
+  for (const route of routes) {
+    let words = 0;
+    let matched = true;
+    let i = 0;
+    for (; i < route.length; i++) {
+      const seg = route[i]!;
+      if ("rest" in seg) { i = parts.length; break; }
+      const part = parts[i];
+      if (part === undefined) { matched = false; break; }
+      if ("word" in seg) {
+        if (seg.word !== part) { matched = false; break; }
+        words += 1;
+      }
+    }
+    if (!matched || (i < parts.length)) continue;
+    const pattern = "/" + route.map((seg) => ("word" in seg ? seg.word : "param" in seg ? ":id" : "*")).join("/");
+    // The most specific: a word beats a parameter, which beats a catch-all; an exact route beats one
+    // ending in a catch-all ("/" over "/*", "/tasks/new" over "/tasks/:id" over "/tasks/*").
+    const params = route.filter((seg) => "param" in seg).length;
+    const score = words * 4 + params * 2 + (route.some((seg) => "rest" in seg) ? 0 : 1);
+    if (!best || score > best.score) best = { pattern, score };
+  }
+  return best ? best.pattern : null;
+}
+
+// The app's path: the URL's, or a hash router's ("/#/tasks/7" is "/tasks/7"). Never the query.
+function pathOf(w: Window): string {
+  const hash = w.location?.hash ?? "";
+  if (hash.startsWith("#/")) return hash.slice(1).split("?")[0]!;
+  return w.location?.pathname ?? "/";
 }

@@ -80,9 +80,41 @@ Lovable, Cursor and Codex read:
 Your browser key is on the EZLogs install page. It is public by design (it sits in your app's
 JavaScript): it can only send failure reports, never read anything.
 
+## Page views (optional, 0.3.0)
+
+Off unless you turn on **Page views** for the app in EZLogs (Settings → API keys → Install →
+Lovable · Bolt · v0) and pass your app's routes:
+
+```ts
+init({ key: "ezlpub_…", supabaseUrl: import.meta.env.VITE_SUPABASE_URL,
+       pages: ["/", "/tasks", "/tasks/:id", "/settings", "/u/:id"] });
+```
+
+Then, for a signed-in person, it sends which page they opened, as the matching route (`/tasks/:id`),
+and the tables that page read in its first 5 seconds (names only). They read in EZLogs as
+"Ana viewed task".
+
+- A page is named **only** by your route list: fixed parts as written, each changing part as
+  `:name` (`$name` and `[name]` work too), a catch-all as `*`. An address that matches no route is
+  sent as "a page", never as itself. The most specific route wins (`/tasks/new` over `/tasks/:id`).
+- Never a query string, a fragment, the page title or anything on the page; never what a read
+  returned. Nothing for a person who isn't signed in. Nothing is stored on the device.
+- A route change is `pushState`, `replaceState`, the back button or a hash change (hash routers,
+  `/#/tasks`, are read by the path after `#`); the same route again (a filter changing the query
+  string) is not a new view. At most 30 page views a minute.
+- The person is whoever was signed in while the page was open, from the login your app's own
+  Supabase calls carry. After a sign-out, or once calls carry no login, nobody is named and nothing
+  is sent.
+- EZLogs records them only while page views are on for the app: turning them off stops them at once.
+
+Mention it in your privacy notice, for example: "We record which pages signed-in users open, to
+keep an activity log of who did what in our app. EZLogs processes it for us, hosted in the EU." In
+the EU, sending what a person opens may need their consent unless it is needed for the service you
+give them: you decide, as the controller.
+
 ## What it never does
 
-- Track clicks, page views or reads.
+- Track clicks. Page views and the tables a page read only with `pages`, as above.
 - Change what your app's calls return, or retry them.
 - Throw. If EZLogs is down, slow or blocked by an ad blocker, your app works exactly the same.
 - Run on the server: `init` does nothing outside a browser.
