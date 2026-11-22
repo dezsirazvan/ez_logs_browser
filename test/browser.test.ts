@@ -153,16 +153,26 @@ describe("@ezlogs/browser", () => {
     expect(fake.reports()).toEqual([]);
   });
 
-  it("reports a failed sign-in by its code: never the email, the password or the message", async () => {
+  it("reports a failed sign-in by its code and the email tried: never the password or the message", async () => {
     const fake = await setup(async (url) =>
       url.includes("/auth/v1/token") ? json(400, { code: 400, error_code: "invalid_credentials", msg: "Invalid login credentials" }) : json(200, {}));
     await fake.w.fetch(`${SUPABASE}/auth/v1/token?grant_type=password`, {
-      method: "POST", body: JSON.stringify({ email: "ana@example.com", password: "hunter2" })
+      method: "POST", body: JSON.stringify({ email: "Ana@Example.com", password: "hunter2" })
     });
     await flush();
     expect(fake.reports()[0]).toEqual({ kind: "failure", method: "POST", path: "/auth/v1/token", status: 400, code: "invalid_credentials",
-                                        at: expect.any(String) });
-    expect(JSON.stringify(fake.reports())).not.toMatch(/hunter2|ana@example\.com|Invalid login/);
+                                        account: "ana@example.com", at: expect.any(String) });
+    expect(JSON.stringify(fake.reports())).not.toMatch(/hunter2|Invalid login/);
+  });
+
+  it("sends no email for a successful sign-in, a non-account call, or a value that is not an email", async () => {
+    const fake = await setup(async (url) =>
+      url.includes("ok") ? json(200, {}) : json(400, { code: "x" }));
+    await fake.w.fetch(`${SUPABASE}/auth/v1/token?grant_type=password&ok=1`, { method: "POST", body: JSON.stringify({ email: "ana@example.com", password: "p" }) });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/profiles`, { method: "POST", body: JSON.stringify({ email: "bob@example.com" }) });
+    await fake.w.fetch(`${SUPABASE}/auth/v1/signup`, { method: "POST", body: JSON.stringify({ email: "hunter2", password: "p" }) });
+    await flush();
+    expect(JSON.stringify(fake.reports())).not.toMatch(/ana@|bob@|hunter2|"account"/);
   });
 
   it("never sends an error message, which can quote what was typed, nor an odd code", async () => {

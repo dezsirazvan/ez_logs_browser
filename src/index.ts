@@ -23,8 +23,10 @@
  * here; the token itself never leaves. A session id is not a credential (nothing can be opened
  * with it), and EZLogs names the person only when your database recorded that session.
  *
- * What it never sends: login tokens or any other credential, emails, passwords, error messages,
- * request or response bodies, query strings, file names. It never reads a request body.
+ * What it never sends: login tokens or any other credential, passwords, error messages, request or
+ * response bodies, query strings, file names. The one exception, so you see which account was tried:
+ * when a sign-in, sign-up, sign-in link or password reset call fails, the email typed into it (read
+ * from that call's own JSON body, the `email` field only; never the password).
  *
  * One click, one action: in the two seconds after a click, a form submit or Enter, it adds one
  * `x-correlation-id` header to your app's Supabase calls, so EZLogs groups that click's changes and
@@ -67,6 +69,7 @@ interface Report {
   code?: string;
   correlation_id?: string;
   session_id?: string;
+  account?: string; // a failed account call: the email typed into it
   at: string;
 }
 
@@ -88,6 +91,7 @@ interface Call {
   supabase: boolean;
   server: boolean; // the app's own server code: a server function, or an Edge Function
   sessionId?: string;
+  account?: string;
   correlationId?: string;
   gesture?: { until: number; inflight: number };
 }
@@ -427,7 +431,32 @@ function describe(w: Window, supabaseOrigin: string, input: RequestInfo | URL, i
   // The login the call itself carries (a Supabase call; a server function the app sends it to).
   const sessionId = sessionIdOf(headersOf(input, init));
   if (sessionId) call.sessionId = sessionId;
+  if (supabase && accountCall(url)) {
+    const account = emailOf(init?.body);
+    if (account) call.account = account;
+  }
   return call;
+}
+
+// Account calls whose failure names the account tried: a password sign-in, a sign-up, a sign-in link,
+// a password reset. Never a refresh (no email in it) or anything else.
+function accountCall(url: URL): boolean {
+  const p = url.pathname;
+  if (p === "/auth/v1/token") return url.searchParams.get("grant_type") === "password";
+  return p === "/auth/v1/signup" || p === "/auth/v1/otp" || p === "/auth/v1/magiclink" || p === "/auth/v1/recover";
+}
+
+// The `email` field of the call's own JSON body, nothing else; only an address that looks like one.
+// The charset EZLogs masks on shared links: anything else (a password typed into the email box) is dropped.
+const EMAIL = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,}$/;
+function emailOf(body: unknown): string | undefined {
+  if (typeof body !== "string" || body.length > 4_000) return undefined;
+  try {
+    const email = JSON.parse(body)?.email;
+    return typeof email === "string" && EMAIL.test(email.trim()) ? email.trim().toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 // The part of a Supabase path that names the call: /rest/v1/<table>, /rest/v1/rpc/<fn>,
@@ -472,7 +501,7 @@ function onResponse(call: Call, response: Response, report: (r: Report) => void)
 function failure(call: Call, status: number, code: string | undefined): Report {
   const safeCode = code && /^[A-Za-z0-9_]{1,60}$/.test(code) ? code : undefined;
   return { kind: "failure", method: call.method, path: call.path, status, code: safeCode, correlation_id: call.correlationId,
-           session_id: call.sessionId, at: new Date().toISOString() };
+           session_id: call.sessionId, account: call.account, at: new Date().toISOString() };
 }
 
 function correlationId(): string {

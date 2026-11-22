@@ -16,13 +16,15 @@ with the EZLogs database install, which records what your app changed and who di
 | Sent, only for a call that failed or a sign-out | Never sent |
 |---|---|
 | the method (`POST`, `PATCH`, …) | login tokens or any other credential |
-| the table, function or bucket the call was for | emails, passwords, names, ids |
+| the table, function or bucket the call was for | passwords, names, ids, any other email |
 | the status (`409`, or `0` when there was no answer) | error messages (they can quote what was typed) |
 | Supabase's error code (`23505`, `invalid_credentials`) | request or response bodies, query strings, file names |
 | the time, and the id of the click it belongs to | your Supabase API key |
 | the Supabase session id (below) | |
+| for a failed sign-in, sign-up, sign-in link or password reset: the email typed into it, so you see which account was tried | |
 
-It never reads a request body. Successful calls are not reported (except a sign-out), a call your
+It reads no request body, except the `email` field of a failed account call (never its password).
+Successful calls are not reported (except a sign-out), a call your
 app cancelled (navigation, unmount, an abort signal) is not a failure, and a session refresh failing
 and `.single()` finding no row are not reported either.
 

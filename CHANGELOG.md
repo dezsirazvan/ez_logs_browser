@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] — 2026-11-22
+
+### Added
+- **A failed sign-in names the account it tried.** When a sign-in, sign-up, sign-in link or password reset call fails, the report carries the email typed into it (the `email` field of that call's JSON body only; never the password), so the activity log reads "tried to sign in as ana@example.com but it failed". Nothing else changes: other calls, successful calls and other bodies are never read.
+
 ## 0.4.0 (unreleased)
 
 - **`groupClicks()`** for any app with an EZLogs agent on its server (Rails, Next.js): a click's

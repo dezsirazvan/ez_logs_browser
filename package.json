@@ -1,7 +1,7 @@
 {
   "name": "@ezlogs/browser",
-  "version": "0.4.0",
-  "description": "Tells EZLogs when your app's Supabase calls fail. Sends no login, no email, no data. Never breaks your app.",
+  "version": "0.4.1",
+  "description": "Tells EZLogs when your app's Supabase calls fail. Sends no login, no password, no data (a failed sign-in names the email typed). Never breaks your app.",
   "type": "module",
   "exports": {
     ".": {
