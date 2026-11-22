@@ -121,6 +121,20 @@ keep an activity log of who did what in our app. EZLogs processes it for us, hos
 the EU, sending what a person opens may need their consent unless it is needed for the service you
 give them: you decide, as the controller.
 
+## One click, one action, for any app (0.4.0)
+
+For a Rails or Next.js app with an EZLogs agent on its server (no Supabase needed): a click that
+makes several requests (a save and a reload, a Turbo form and its follow-up) is one action.
+
+```js
+import { groupClicks } from "@ezlogs/browser";
+groupClicks();
+```
+
+During a click, a form submit or Enter, the page's requests to its own server (same origin, `fetch`
+and `XMLHttpRequest`) carry one `x-correlation-id`, which the agents group by. It needs no key,
+sends nothing anywhere, and never touches a request to another site.
+
 ## What it never does
 
 - Track clicks. Page views and the tables a page read only with `pages`, as above.

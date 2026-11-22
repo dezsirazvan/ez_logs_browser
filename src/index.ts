@@ -9,9 +9,15 @@
  *
  * What it sends, for a call to your Supabase project (database, files, accounts, functions) or to
  * your app's own server functions (`/_serverFn/…`) that failed (status 400 or more, or no answer;
- * a call your app cancelled is not a failure), and for a successful sign-out: the method, the
- * table, function or bucket the call was for, the status, Supabase's error code, the time, the
- * click's id (below) and the Supabase session id. Nothing else.
+ * a call your app cancelled is not a failure), for a successful sign-out, and for a click's write
+ * (POST, PUT, PATCH, DELETE) to your app's server code answered as wrapped by @ezlogs/server:
+ * the method, the table, function or bucket the call was for, the status, Supabase's error code,
+ * the time, the click's id (below) and the Supabase session id. Nothing else.
+ *
+ * Server code (0.4.0): during a click, the click's id also goes on your app's own server function
+ * calls (same origin; never on an Edge Function, whose CORS could refuse it). @ezlogs/server passes
+ * it on to the database and answers with the id its work used; for a click's write (not a read), the
+ * module reports that id with the session, so the server's work reads as the person's.
  *
  * Who it was: the session id is the `session_id` field inside the call's own login token, read
  * here; the token itself never leaves. A session id is not a credential (nothing can be opened
@@ -54,7 +60,7 @@ export interface InitOptions {
 }
 
 interface Report {
-  kind: "failure" | "sign_out";
+  kind: "failure" | "sign_out" | "server_call";
   method: string;
   path: string;
   status: number;
@@ -80,17 +86,24 @@ interface Call {
   method: string;
   path: string;
   supabase: boolean;
+  server: boolean; // the app's own server code: a server function, or an Edge Function
   sessionId?: string;
   correlationId?: string;
+  gesture?: { until: number; inflight: number };
 }
 
 const DEFAULT_ENDPOINT = "https://app.ezlogs.io/api/ingest/browser";
 const SUPABASE_AREAS = /^\/(rest|storage|auth|functions)\/v1(\/|$)/;
 const STAMPED_AREAS = /^\/(rest|storage|auth)\/v1(\/|$)/; // Edge Functions set their own CORS
+const EDGE_FUNCTION = /^\/functions\/v1\/[^/]+$/;
+const CLICK = /^ezl_\d{13}_[0-9a-f]{8}$/;
 const SERVER_FUNCTION = /^\/_serverFn\//;
 const STORAGE_PREFIXES = new Set(["public", "sign", "authenticated", "info", "list", "upload"]);
 const GESTURE_MS = 2_000;
-const GESTURE_CALLS = 10;
+const GESTURE_AFTER_MS = 1_000; // a click's chain: the next call starts after the previous answered
+const GESTURE_MAX_MS = 30_000; // never longer, even if a call of the click never answers
+const GESTURE_CALLS = 10; // writes per click; reads are stamped too and never counted
+const PROBE_TRIES = 3;
 const REPEAT_MS = 10_000;
 const PER_MINUTE = 20;
 const MAX_BODY_BYTES = 15_000;
@@ -134,13 +147,19 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string,
   let minuteStart = Date.now();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let probe: "waiting" | "asking" | "yes" | "no" = "waiting";
-  let gesture: { id: string; until: number; calls: number } | undefined;
+  let probeTries = 0;
+  let probeAgainAt = 0;
+  // A click's id lasts 2 seconds, and while the calls it started are still waiting for an answer
+  // (plus a second after each answer), so a chain of calls (save, then reload) stays one action.
+  let gesture: { id: string; until: number; ends: number; writes: number; inflight: number } | undefined;
+
 
   // One correlation id per click, submit or Enter, for the app's next few Supabase calls.
   const onGesture = (event: Event) => {
     try {
       if (event.type === "keydown" && (event as KeyboardEvent).key !== "Enter") return;
-      gesture = { id: correlationId(), until: Date.now() + GESTURE_MS, calls: 0 };
+      const now = Date.now();
+      gesture = { id: correlationId(), until: now + GESTURE_MS, ends: now + GESTURE_MAX_MS, writes: 0, inflight: 0 };
     } catch {
       gesture = undefined;
     }
@@ -156,10 +175,16 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string,
   // Stamp only once a request proved this Supabase answers one carrying the header (its CORS
   // allows it), so an app call is never sent with it before that and none is ever lost. Asked
   // once, of the project's public settings endpoint (answers 200), with the app's own public key.
+  // No answer at all (offline, a blocked network, or a refused CORS check, which looks the same)
+  // is asked again later, at most 3 times; an answer decides for good.
   const askOnce = (apikey: string) => {
     probe = "asking";
+    probeTries += 1;
     send(`${supabaseOrigin}/auth/v1/settings`, { method: "GET", headers: { apikey, "x-correlation-id": correlationId() } })
-      .then((r) => { probe = r.ok ? "yes" : "no"; }, () => { probe = "no"; });
+      .then((r) => { probe = r.ok ? "yes" : "no"; }, () => {
+        probe = probeTries < PROBE_TRIES ? "waiting" : "no";
+        probeAgainAt = Date.now() + 10_000 * probeTries;
+      });
   };
 
   const flush = (all = false) => {
@@ -176,8 +201,10 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string,
 
   const report = (r: Report) => {
     const now = Date.now();
-    const repeat = `${r.kind} ${r.method} ${r.path} ${r.status} ${r.code ?? ""}`;
-    if ((recent.get(repeat) ?? 0) > now - REPEAT_MS) return; // a retry loop is one report
+    // A retry loop within one click is one report; the same failure on another click is reported.
+    // A retry may fail differently each time (no answer, then a 500): the status counts by class.
+    const repeat = `${r.kind} ${r.method} ${r.path} ${Math.floor(r.status / 100)} ${r.code ?? ""} ${r.correlation_id ?? ""}`;
+    if ((recent.get(repeat) ?? 0) > now - REPEAT_MS) return;
     recent.set(repeat, now);
     if (recent.size > 200) recent.clear();
     if (now - minuteStart > 60_000) { minuteStart = now; sentThisMinute = 0; }
@@ -281,15 +308,24 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string,
     let args: [RequestInfo | URL, RequestInit | undefined] = [input, init];
     try {
       call = describe(w, supabaseOrigin, input, init);
-      if (call?.supabase && probe === "waiting") {
+      if (call?.supabase && probe === "waiting" && Date.now() >= probeAgainAt) {
         const apikey = headersOf(input, init)?.get("apikey");
         if (apikey && apikey.length <= 2_000) askOnce(apikey);
       }
-      const g = gesture && gesture.until > Date.now() && gesture.calls < GESTURE_CALLS ? gesture : undefined;
+      const write = call !== undefined && call.method !== "GET" && call.method !== "HEAD";
+      const now = Date.now();
+      const g = gesture && now < gesture.ends && (gesture.until > now || gesture.inflight > 0) &&
+                !(write && gesture.writes >= GESTURE_CALLS) ? gesture : undefined;
       if (call && g) {
-        g.calls += 1;
+        if (write) g.writes += 1;
+        g.inflight += 1;
+        call.gesture = g;
         call.correlationId = g.id;
-        if (probe === "yes" && call.supabase && STAMPED_AREAS.test(call.path) && typeof input === "string" && plain(init)) {
+        // The click's id goes on calls to the app's own server functions (same origin: nothing can
+        // refuse it) and on Supabase once it proved it accepts the header. Never on an Edge Function:
+        // its CORS could refuse it (its answer says which click its work belongs to instead).
+        const stamp = (call.server && !call.supabase) || (call.supabase && probe === "yes" && STAMPED_AREAS.test(call.path));
+        if (stamp && typeof input === "string" && plain(init)) {
           const headers = new Headers(init?.headers);
           if (!headers.has("x-correlation-id")) headers.set("x-correlation-id", g.id);
           args = [input, { ...init, headers }];
@@ -302,10 +338,28 @@ function start(w: Window, key: string, supabaseOrigin: string, endpoint: string,
     const result = original.apply(w, args);
     if (call) {
       const c = call;
+      const answered = () => {
+        const g = c.gesture;
+        if (!g) return;
+        c.gesture = undefined;
+        g.inflight -= 1;
+        g.until = Math.max(g.until, Date.now() + GESTURE_AFTER_MS);
+      };
+      result.then(answered, answered).catch(() => undefined);
       result.then(
         (response) => {
           try {
             if (c.supabase) onAnswer(c, response.status);
+            // A click's write to the app's server code (never a read: GET, HEAD), answered as wrapped by
+            // @ezlogs/server with the click id its database work used: it names who did that work.
+            // EZLogs keeps it only once that work's changes are recorded.
+            const worked = response.headers?.get?.("x-ezlogs-correlation") ?? "";
+            if (c.server && c.correlationId && response.status < 400 && c.method !== "GET" && c.method !== "HEAD" &&
+                response.headers?.get?.("x-ezlogs") === "1" && CLICK.test(worked)) {
+              const session = c.sessionId ?? lastSession;
+              if (session) report({ kind: "server_call", method: c.method, path: c.path, status: response.status,
+                                    correlation_id: worked, session_id: session, at: new Date().toISOString() });
+            }
             onResponse(c, response, report);
           } catch {
             // never break the app
@@ -368,8 +422,10 @@ function describe(w: Window, supabaseOrigin: string, input: RequestInfo | URL, i
 
   const method = String(init?.method || (typeof input === "object" && "method" in input ? (input as Request).method : "GET")).toUpperCase();
   if (!/^[A-Z]{1,10}$/.test(method)) return undefined; // nothing odd ever goes into a report
-  const call: Call = { method, path: serverFunction ? "/_serverFn" : shortPath(url.pathname), supabase };
-  const sessionId = supabase ? sessionIdOf(headersOf(input, init)) : undefined;
+  const path = serverFunction ? "/_serverFn" : shortPath(url.pathname);
+  const call: Call = { method, path, supabase, server: serverFunction || (supabase && EDGE_FUNCTION.test(path)) };
+  // The login the call itself carries (a Supabase call; a server function the app sends it to).
+  const sessionId = sessionIdOf(headersOf(input, init));
   if (sessionId) call.sessionId = sessionId;
   return call;
 }
@@ -490,4 +546,94 @@ function pathOf(w: Window): string {
   const hash = w.location?.hash ?? "";
   if (hash.startsWith("#/")) return hash.slice(1).split("?")[0]!;
   return w.location?.pathname ?? "/";
+}
+
+const GROUP_STATE = Symbol.for("ezlogs.browser.groupClicks");
+
+/**
+ * One click, one action, for any web app (Rails, Next.js, anything with an EZLogs agent on its
+ * server): during a click, a form submit or Enter, the requests the page makes to its own server
+ * (same origin, fetch and XMLHttpRequest) carry one `x-correlation-id`, so the server agent groups
+ * that click's requests into one action. Needs no key and sends nothing anywhere: it only adds that
+ * header to the page's own same-origin requests (which nothing can refuse). Safe to call more than
+ * once and on the server (it does nothing there).
+ */
+export function groupClicks(): void {
+  try {
+    const w = typeof window === "undefined" ? undefined : (window as Window & { [GROUP_STATE]?: true });
+    if (!w || typeof w.fetch !== "function" || w[GROUP_STATE]) return;
+    w[GROUP_STATE] = true;
+    let gesture: { id: string; until: number; ends: number; inflight: number } | undefined;
+    const active = () => {
+      const now = Date.now();
+      return gesture && now < gesture.ends && (gesture.until > now || gesture.inflight > 0) ? gesture : undefined;
+    };
+    const onGesture = (event: Event) => {
+      try {
+        if (event.type === "keydown" && (event as KeyboardEvent).key !== "Enter") return;
+        const now = Date.now();
+        gesture = { id: correlationId(), until: now + GESTURE_MS, ends: now + GESTURE_MAX_MS, inflight: 0 };
+      } catch {
+        gesture = undefined;
+      }
+    };
+    for (const type of ["click", "submit", "keydown"]) {
+      try { w.document?.addEventListener(type, onGesture, { capture: true, passive: true }); } catch { /* no document */ }
+    }
+    const sameOrigin = (href: string) => {
+      try { return new URL(href, w.location?.href).origin === w.location?.origin; } catch { return false; }
+    };
+    const settle = (g: { until: number; inflight: number }) => {
+      g.inflight -= 1;
+      g.until = Math.max(g.until, Date.now() + GESTURE_AFTER_MS);
+    };
+
+    const original: Fetch = w.fetch;
+    w.fetch = function (this: unknown, input: RequestInfo | URL, init?: RequestInit) {
+      let args: [RequestInfo | URL, RequestInit | undefined] = [input, init];
+      let g: ReturnType<typeof active>;
+      try {
+        g = active();
+        const href = typeof input === "string" ? input : input instanceof URL ? input.href : undefined;
+        if (g && href !== undefined && sameOrigin(href) && plain(init)) {
+          const headers = new Headers(init?.headers);
+          if (!headers.has("x-correlation-id")) headers.set("x-correlation-id", g.id);
+          args = [input, { ...init, headers }];
+          g.inflight += 1;
+        } else {
+          g = undefined;
+        }
+      } catch {
+        g = undefined;
+        args = [input, init];
+      }
+      const result = original.apply(w, args);
+      if (g) { const s = g; result.then(() => settle(s), () => settle(s)).catch(() => undefined); }
+      return result;
+    } as Fetch;
+
+    const XHR = (w as unknown as { XMLHttpRequest?: typeof XMLHttpRequest }).XMLHttpRequest;
+    if (XHR?.prototype) {
+      const open = XHR.prototype.open;
+      const send = XHR.prototype.send;
+      const marks = new WeakMap<XMLHttpRequest, boolean>();
+      XHR.prototype.open = function (this: XMLHttpRequest, ...openArgs: unknown[]) {
+        try { marks.set(this, sameOrigin(String(openArgs[1]))); } catch { /* fine */ }
+        return (open as (...a: unknown[]) => void).apply(this, openArgs);
+      } as typeof XHR.prototype.open;
+      XHR.prototype.send = function (this: XMLHttpRequest, body?: Document | XMLHttpRequestBodyInit | null) {
+        try {
+          const g = marks.get(this) ? active() : undefined;
+          if (g) {
+            this.setRequestHeader("x-correlation-id", g.id);
+            g.inflight += 1;
+            this.addEventListener("loadend", () => settle(g), { once: true });
+          }
+        } catch { /* never break the request */ }
+        return send.call(this, body);
+      };
+    }
+  } catch {
+    // never break the app
+  }
 }

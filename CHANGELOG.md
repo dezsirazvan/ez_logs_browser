@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+- **`groupClicks()`** for any app with an EZLogs agent on its server (Rails, Next.js): a click's
+  requests to the app's own server (same origin, fetch and XMLHttpRequest) carry one
+  `x-correlation-id`, so the agent groups them into one action. No key, sends nothing.
+- With **@ezlogs/server** in the app's server code, the work a click makes the server do reads as
+  that person's ("Ana archived 3 tasks", not "App server"). During a click, the click's id also goes
+  on the app's own server function calls (same origin; never on an Edge Function, whose CORS could
+  refuse it). For a click's write (POST, PUT, PATCH, DELETE; never a read) that the server answered
+  as wrapped, the module reports the id the server's work used (`x-ezlogs-correlation`) with the
+  method, path, status, time and session id: the same fields as a failure. EZLogs keeps it only once
+  that work's changes are recorded.
+- A failing server function call now carries the session of the login the call itself sends.
+- One click stays one action through a chain of calls: a click's id lasts while the calls it
+  started wait for an answer (and a second after each answer, so "save, then reload" stays
+  together), at most 30 seconds. Only writes count toward the 10 calls a click may stamp.
+- A call that is retried and fails differently each time (no answer, then a 500) is one report: the
+  status counts by class (none, 4xx, 5xx) in the once-every-10-seconds check.
+- The one check that your Supabase accepts the click header is asked again (after 10 and 20
+  seconds) when it got no answer at all (offline, a blocked network); an answer still decides.
+- The same failure on two different clicks is two reports; a retry loop within one click is
+  still one.
+
 ## 0.3.1 (2026-11-21)
 
 - Page views name the record a page shows. Where your route calls a part an id (`:id`, `$taskId`,

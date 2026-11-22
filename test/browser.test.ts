@@ -54,6 +54,11 @@ async function settle() {
   for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
 }
 
+// A server function call without a login, failing: no session in its report.
+async function fetchNoLogin(fake: { w: { fetch: (u: string, i?: RequestInit) => Promise<Response> } }) {
+  await fake.w.fetch("/_serverFn/89b33048", { method: "GET" });
+}
+
 async function load() {
   vi.resetModules();
   return import("../src/index");
@@ -202,11 +207,68 @@ describe("@ezlogs/browser", () => {
     expect(fake.reports().map((r) => r.session_id)).toEqual([undefined, undefined, undefined]);
   });
 
-  it("reports the app's own server functions failing, without anything about the person", async () => {
+  it("reports the app's own server functions failing, with the session of the login the call carries", async () => {
     const fake = await setup(async () => new Response(null, { status: 500 }));
     await fake.w.fetch("/_serverFn/89b33048", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+    await fetchNoLogin(fake);
     await flush();
-    expect(fake.reports()[0]).toEqual({ kind: "failure", method: "POST", path: "/_serverFn", status: 500, at: expect.any(String) });
+    expect(fake.reports()[0]).toEqual({ kind: "failure", method: "POST", path: "/_serverFn", status: 500, session_id: SESSION, at: expect.any(String) });
+    expect(fake.reports()[1]).toEqual({ kind: "failure", method: "GET", path: "/_serverFn", status: 500, at: expect.any(String) });
+  });
+
+  describe("the app's own server code (with @ezlogs/server)", () => {
+    const wrapped = (id: string | null, status = 200) =>
+      new Response(null, { status, headers: id ? { "x-ezlogs": "1", "x-ezlogs-correlation": id } : { "x-ezlogs": "1" } });
+    const SERVER_ID = `ezl_${Date.now()}_5e5e5e5e`;
+
+    it("puts the click's id on its server function calls and reports a write with the id the server used", async () => {
+      let sent: string | null = null;
+      const fake = await setup(async (url, init) => {
+        if (url === ENDPOINT) return new Response(null, { status: 202 });
+        sent = header(init, "x-correlation-id");
+        return wrapped(sent);
+      });
+      fake.fire("click");
+      await fake.w.fetch("/_serverFn/89b33048", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      expect(sent).toMatch(/^ezl_/);
+      await flush();
+      expect(fake.reports()).toEqual([{ kind: "server_call", method: "POST", path: "/_serverFn", status: 200, correlation_id: sent,
+                                         session_id: SESSION, at: expect.any(String) }]);
+    });
+
+    it("reports nothing for a read, an unwrapped server, a call outside a click, or without a known person", async () => {
+      const fake = await setup(async (url) => (url === ENDPOINT ? new Response(null, { status: 202 }) :
+                                               url.includes("plain") ? new Response(null) : wrapped(SERVER_ID)));
+      fake.fire("click");
+      await fake.w.fetch("/_serverFn/89b33048", { method: "GET", headers: { Authorization: `Bearer ${TOKEN}` } });
+      await fake.w.fetch("/_serverFn/plain", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      vi.advanceTimersByTime(3_000);
+      await fake.w.fetch("/_serverFn/89b33048", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      fake.fire("click");
+      await fake.w.fetch("/_serverFn/89b33048", { method: "POST" });
+      await flush();
+      expect(fake.reports()).toEqual([]);
+      expect(header(fake.appCalls("/_serverFn/plain")[0]!.init, "x-correlation-id")).toMatch(/^ezl_/); // same origin: stamped
+    });
+
+    it("never sends an Edge Function a header, and reports its write with the id the function answered", async () => {
+      const fn = `${SUPABASE}/functions/v1/send-invoice`;
+      const fake = await setup(async (url) => (url === ENDPOINT ? new Response(null, { status: 202 }) : url === fn ? wrapped(SERVER_ID) : json(200, {})));
+      fake.fire("click");
+      await fake.w.fetch(fn, { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toBeNull();
+      await flush();
+      expect(fake.reports()).toEqual([{ kind: "server_call", method: "POST", path: "/functions/v1/send-invoice", status: 200,
+                                         correlation_id: SERVER_ID, session_id: SESSION, at: expect.any(String) }]);
+    });
+
+    it("ignores an answered id that is not EZLogs' own", async () => {
+      const fake = await setup(async (url) => (url === ENDPOINT ? new Response(null, { status: 202 }) : wrapped("someone-elses-id")));
+      fake.fire("click");
+      await fake.w.fetch("/_serverFn/89b33048", { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } });
+      await flush();
+      expect(fake.reports()).toEqual([]);
+    });
   });
 
   it("asks once, with the app's own key, whether Supabase accepts the header, then stamps one id per click", async () => {
@@ -261,6 +323,83 @@ describe("@ezlogs/browser", () => {
     expect(stamped).toHaveLength(10);
   });
 
+  it("keeps a click's id for its chain of calls (save, then reload), and counts only writes", async () => {
+    let finish: (r: Response) => void = () => undefined;
+    const fake = await setup(async (url, init) => {
+      if (settingsOk(url)) return settingsOk(url)!;
+      if (url.endsWith("/slow")) return new Promise<Response>((r) => { finish = r; });
+      return json(init?.method === "GET" || !init?.method ? 200 : 201, {});
+    });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    fake.fire("click");
+    const slow = fake.w.fetch(`${SUPABASE}/rest/v1/slow`, { method: "POST" });
+    vi.advanceTimersByTime(3_000); // the save takes 3 seconds
+    finish(json(201, {}));
+    await slow;
+    await settle();
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "GET" }); // the reload right after
+    const id = header(fake.appCalls(`${SUPABASE}/rest/v1/slow`)[0]!.init, "x-correlation-id");
+    expect(id).toMatch(/^ezl_/);
+    expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toBe(id);
+
+    fake.fire("click");
+    for (let i = 0; i < 12; i++) await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "GET" });
+    for (let i = 0; i < 12; i++) await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    const stamped = fake.calls.slice(-24).map((c) => Boolean(header(c.init, "x-correlation-id")));
+    expect(stamped.slice(0, 12).every(Boolean)).toBe(true); // reads: all stamped, none counted
+    expect(stamped.slice(12).filter(Boolean)).toHaveLength(10);
+  });
+
+  it("never keeps a click's id past 30 seconds, even while one of its calls never answers", async () => {
+    const fake = await setup(async (url) => settingsOk(url) ?? (url.endsWith("/hang") ? new Promise<Response>(() => undefined) : json(201, {})));
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    fake.fire("click");
+    void fake.w.fetch(`${SUPABASE}/rest/v1/hang`, { method: "POST" });
+    vi.advanceTimersByTime(10_000);
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toMatch(/^ezl_/); // still in flight: same click
+    vi.advanceTimersByTime(21_000);
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toBeNull();
+  });
+
+  it("asks again later when the header check got no answer at all, at most 3 times", async () => {
+    let attempts = 0;
+    const fake = await setup(async (url) => {
+      if (url === SETTINGS) { attempts += 1; if (attempts < 2) throw new TypeError("offline"); return json(200, {}); }
+      return json(201, {});
+    });
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    expect(attempts).toBe(1); // not again at once
+    vi.advanceTimersByTime(11_000);
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    expect(attempts).toBe(2);
+    fake.fire("click");
+    await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toMatch(/^ezl_/);
+  });
+
+  it("reports the same failure once per click, even within 10 seconds", async () => {
+    const fake = await setup(async (url) => settingsOk(url) ?? (url === ENDPOINT ? new Response(null, { status: 202 }) : json(409, { code: "23505" })));
+    await fake.w.fetch(`${SUPABASE}/rest/v1/x`, { headers: { apikey: "anon" } });
+    await settle();
+    for (let click = 0; click < 2; click++) {
+      fake.fire("click");
+      for (let i = 0; i < 3; i++) await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+      vi.advanceTimersByTime(2_500);
+    }
+    await flush();
+    const tasks = fake.reports().filter((r: { path: string }) => r.path === "/rest/v1/tasks");
+    expect(tasks).toHaveLength(2);
+    expect(new Set(tasks.map((r: { correlation_id: string }) => r.correlation_id)).size).toBe(2);
+  });
+
   it("never adds the header when Supabase refused it, and never retries the app's call", async () => {
     const fake = await setup(async (url) => {
       if (url === SETTINGS) throw new TypeError("CORS");
@@ -294,6 +433,19 @@ describe("@ezlogs/browser", () => {
     const custom = new Init();
     await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, custom);
     expect(fake.calls.at(-1)!.init).toBe(custom);
+  });
+
+  it("reports a retry that fails with different statuses of one class once, but a different class again", async () => {
+    let n = 0;
+    const fake = await setup(async (url) => (url === ENDPOINT ? new Response(null, { status: 202 }) : ++n % 2 ? json(500, { message: "a" }) : json(502, { message: "b" })));
+    for (let i = 0; i < 4; i++) await fake.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    await flush();
+    expect(fake.reports()).toHaveLength(1);
+    const down = await setup(async (url) => (url === ENDPOINT ? new Response(null, { status: 202 }) : json(409, { code: "23505" })));
+    await down.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    await down.w.fetch(`${SUPABASE}/rest/v1/tasks`, { method: "POST" });
+    await flush();
+    expect(down.reports()).toHaveLength(1);
   });
 
   it("sends a retry loop once and at most 20 reports a minute", async () => {
@@ -540,5 +692,65 @@ describe("@ezlogs/browser", () => {
       expect(views(fake)).toHaveLength(30);
       expect(fake.reports().filter((r: { kind: string }) => r.kind === "failure")).toHaveLength(1);
     });
+  });
+});
+
+describe("groupClicks (any stack: one click, one action)", () => {
+  beforeEach(() => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] }));
+  afterEach(() => {
+    vi.useRealTimers();
+    delete (globalThis as { window?: unknown }).window;
+  });
+
+  async function grouped() {
+    const fake = fakeWindow(async () => new Response(null, { status: 200 }));
+    class FakeXhr {
+      headers: Record<string, string> = {};
+      listeners: Record<string, () => void> = {};
+      open(_m: string, _u: string) { /* recorded by the module */ }
+      setRequestHeader(name: string, value: string) { this.headers[name] = value; }
+      addEventListener(type: string, fn: () => void) { this.listeners[type] = fn; }
+      send() { this.listeners.loadend?.(); }
+    }
+    (fake.w as unknown as { XMLHttpRequest: unknown }).XMLHttpRequest = FakeXhr;
+    (globalThis as { window?: unknown }).window = fake.w;
+    const { groupClicks } = await load();
+    groupClicks();
+    return { fake, FakeXhr };
+  }
+
+  it("puts one id on a click's own-server requests, fetch and XHR, and nothing outside a click", async () => {
+    const { fake, FakeXhr } = await grouped();
+    await fake.w.fetch("/orders", { method: "POST" });
+    expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toBeNull();
+    fake.fire("submit");
+    await fake.w.fetch("/orders", { method: "POST" });
+    await fake.w.fetch("https://app.example.com/orders/7", { method: "GET" });
+    const xhr = new FakeXhr();
+    xhr.open("PATCH", "/orders/7");
+    xhr.send();
+    const ids = fake.calls.slice(-2).map((c) => header(c.init, "x-correlation-id"));
+    expect(ids[0]).toMatch(/^ezl_\d{13}_[0-9a-f]{8}$/);
+    expect(ids[1]).toBe(ids[0]);
+    expect(xhr.headers["x-correlation-id"]).toBe(ids[0]);
+  });
+
+  it("never adds it to another site's request, and sends nothing anywhere", async () => {
+    const { fake } = await grouped();
+    fake.fire("click");
+    await fake.w.fetch("https://api.stripe.com/v1/charges", { method: "POST" });
+    expect(header(fake.calls.at(-1)!.init, "x-correlation-id")).toBeNull();
+    expect(fake.calls.map((c) => c.url)).toEqual(["https://api.stripe.com/v1/charges"]);
+  });
+
+  it("starts a new id for the next click", async () => {
+    const { fake } = await grouped();
+    fake.fire("click");
+    await fake.w.fetch("/a", { method: "POST" });
+    vi.advanceTimersByTime(4_000);
+    fake.fire("click");
+    await fake.w.fetch("/b", { method: "POST" });
+    const [a, b] = fake.calls.map((c) => header(c.init, "x-correlation-id"));
+    expect(a).not.toBe(b);
   });
 });
