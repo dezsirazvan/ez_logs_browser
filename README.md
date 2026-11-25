@@ -13,7 +13,7 @@ with the EZLogs database install, which records what your app changed and who di
 
 ## What it sends, and what it never sends
 
-| Sent, only for a call that failed or a sign-out | Never sent |
+| Sent, only for a call that failed, a sign-out, or a click's write to your server code (below) | Never sent |
 |---|---|
 | the method (`POST`, `PATCH`, …) | login tokens or any other credential |
 | the table, function or bucket the call was for | passwords, names, ids, any other email |
@@ -24,7 +24,11 @@ with the EZLogs database install, which records what your app changed and who di
 | for a failed sign-in, sign-up, sign-in link or password reset: the email typed into it, so you see which account was tried | |
 
 It reads no request body, except the `email` field of a failed account call (never its password).
-Successful calls are not reported (except a sign-out), a call your
+Successful calls are not reported, except a sign-out and one more: a click's write (`POST`, `PUT`,
+`PATCH`, `DELETE`; never a read) to your app's own server functions (`/_serverFn/…`) that
+@ezlogs/server answered as wrapped. For that one it sends the method, the path `/_serverFn` (never
+which function), the status, the time, the id the server's work used and the session id, so the
+work the server did reads as that person's. A call your
 app cancelled (navigation, unmount, an abort signal) is not a failure, and a session refresh failing
 and `.single()` finding no row are not reported either.
 
@@ -87,7 +91,7 @@ JavaScript): it can only send failure reports, never read anything.
 
 ## Page views (optional, 0.3.0; records 0.3.1)
 
-Off unless you turn on **Page views** for the app in EZLogs (Settings → API keys → Install →
+Off unless you turn on **Page views** for the app in EZLogs (Install & keys →
 Lovable · Bolt · v0) and pass your app's routes:
 
 ```ts
